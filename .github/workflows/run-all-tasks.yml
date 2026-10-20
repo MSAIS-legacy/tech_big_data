@@ -1,0 +1,96 @@
+name: Build and run all assignments
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Решения/**'
+      - '.github/workflows/run-all-tasks.yml'
+  pull_request:
+    paths:
+      - 'Решения/**'
+      - '.github/workflows/run-all-tasks.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: run-all-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-run:
+    name: MSVC build and assignment outputs
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Configure CMake
+        run: cmake -S Решения -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build all assignments
+        run: cmake --build build --config Release --parallel
+
+      - name: Run assignments and publish summary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path outputs | Out-Null
+          Set-Content -Path $env:GITHUB_STEP_SUMMARY -Value '# Assignment outputs' -Encoding utf8
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ''
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value 'CI uses reduced demonstration sizes so that every assignment finishes in one run. Program defaults remain unchanged.'
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ''
+
+          $tasks = @(
+            @{ Id = 'I';    Args = @('3') },
+            @{ Id = 'II';   Args = @('3') },
+            @{ Id = 'III';  Args = @('250000') },
+            @{ Id = 'IV';   Args = @('250000') },
+            @{ Id = 'V';    Args = @('3') },
+            @{ Id = 'VI';   Args = @('40', '12') },
+            @{ Id = 'VII';  Args = @('1.0', '5000', '50.0', '32') },
+            @{ Id = 'VIII'; Args = @('12', '20') }
+          )
+
+          foreach ($task in $tasks) {
+            $id = $task.Id
+            $taskArgs = $task.Args
+            $executable = Join-Path $PWD "build\$id\Release\task_$id.exe"
+            $command = "task_$id.exe $($taskArgs -join ' ')".TrimEnd()
+
+            Write-Host "::group::Task $id — $command"
+            $output = (& $executable @taskArgs 2>&1 | Out-String)
+            $exitCode = $LASTEXITCODE
+            Write-Host ($output.TrimEnd())
+            Write-Host '::endgroup::'
+
+            $outputPath = Join-Path outputs "task_$id.txt"
+            Set-Content -Path $outputPath -Value ($output.TrimEnd()) -Encoding utf8
+
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Task $id"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ''
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ('Command: `{0}`' -f $command)
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ''
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```text'
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($output.TrimEnd())
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```'
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ''
+
+            if ($exitCode -ne 0) {
+              throw "Task $id failed with exit code $exitCode"
+            }
+          }
+
+      - name: Upload assignment outputs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: assignment-outputs
+          path: outputs/*.txt
+          if-no-files-found: warn
+          retention-days: 14
