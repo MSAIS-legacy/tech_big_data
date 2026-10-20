@@ -1,89 +1,140 @@
-#define _USE_MATH_DEFINES
 #include <ppl.h>
-#include <concurrent_queue.h>
-#include <concurrent_vector.h>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace {
-constexpr int kGrid = 400;
-constexpr int kTerms = 50;
-struct Point { double x, y, f; };
-struct ValueDerivative { double f, dfdy; };
+constexpr std::size_t kDefaultCount = 50'000'000;
+constexpr double kScale = 4.0e9;
 
-ValueDerivative evaluate(double x, double y) {
-    double f = 0.0, dfdy = 0.0;
-    for (int k = 1; k <= kTerms; ++k) {
-        const double k3 = static_cast<double>(k) * k * k;
-        const double cos_kx = std::cos(k * x);
-        for (int j = 1; j <= kTerms; ++j) {
-            const double denominator = (1.0 + k3 + static_cast<double>(j) * j * j) * std::sqrt(1.0 + k + j);
-            f += cos_kx * std::sin(j * y) / denominator;
-            dfdy += cos_kx * j * std::cos(j * y) / denominator;
-        }
+using Value = std::uint32_t;
+
+struct Fingerprint {
+    std::uint64_t sum = 0;
+    Value xor_value = 0;
+};
+
+struct BenchmarkResult {
+    std::string name;
+    double seconds;
+};
+
+std::vector<Value> make_sequence(std::size_t count) {
+    std::vector<Value> values(count);
+    for (std::size_t n = 0; n < count; ++n) {
+        values[n] = static_cast<Value>(
+            kScale * std::abs(std::sin(static_cast<double>(n))));
     }
-    return {f, dfdy};
+    return values;
 }
 
-template <class F> double seconds(F&& f) {
-    const auto start = std::chrono::steady_clock::now(); f();
-    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+Fingerprint fingerprint(const std::vector<Value>& values) {
+    Fingerprint result;
+    for (const Value value : values) {
+        result.sum += value;
+        result.xor_value ^= value;
+    }
+    return result;
 }
-void verify(std::size_t count, long double checksum, std::size_t expected_count, long double expected_sum) {
-    if (count != expected_count || std::abs(checksum - expected_sum) > 1e-10L * (1.0L + std::abs(expected_sum)))
-        throw std::runtime_error("parallel result differs from sequential result");
+
+void verify(const std::vector<Value>& values, const Fingerprint& expected) {
+    if (!std::is_sorted(values.begin(), values.end())) {
+        throw std::runtime_error("the result is not sorted");
+    }
+
+    const Fingerprint actual = fingerprint(values);
+    if (actual.sum != expected.sum || actual.xor_value != expected.xor_value) {
+        throw std::runtime_error("sorting changed the input values");
+    }
+}
+
+template <class Sorter>
+BenchmarkResult benchmark(const std::string& name,
+                          const std::vector<Value>& source,
+                          const Fingerprint& expected,
+                          Sorter&& sorter) {
+    // Copying is intentionally excluded from the measured sorting time.
+    std::vector<Value> values = source;
+
+    const auto start = std::chrono::steady_clock::now();
+    std::forward<Sorter>(sorter)(values);
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+
+    verify(values, expected);
+    return {name, elapsed};
+}
+
+void print_result(const BenchmarkResult& result, double sequential_seconds) {
+    std::cout << std::left << std::setw(36) << result.name
+              << std::right << std::setw(12) << result.seconds << " s";
+
+    if (sequential_seconds > 0.0 && result.seconds > 0.0) {
+        std::cout << "  speedup: " << sequential_seconds / result.seconds;
+    }
+    std::cout << '\n';
 }
 } // namespace
 
-int main() {
-    const double step = 2.0 * std::acos(-1.0) / kGrid;
-    std::vector<Point> sequential;
-    const double ts = seconds([&] {
-        for (int ix = 0; ix < kGrid; ++ix) for (int iy = 0; iy < kGrid; ++iy) {
-            const double x = ix * step, y = iy * step;
-            const auto value = evaluate(x, y);
-            if (value.dfdy <= 0.0) sequential.push_back({x, y, value.f});
+int main(int argc, char** argv) {
+    try {
+        const std::size_t count =
+            argc > 1 ? static_cast<std::size_t>(std::stoull(argv[1]))
+                     : kDefaultCount;
+        if (count == 0) {
+            throw std::invalid_argument("N must be greater than zero");
         }
-    });
-    long double expected_sum = 0.0L;
-    for (const auto& p : sequential) expected_sum += p.f;
 
-    concurrency::concurrent_vector<Point> vector_points;
-    const double tv = seconds([&] {
-        concurrency::parallel_for(0, kGrid, [&](int ix) {
-            for (int iy = 0; iy < kGrid; ++iy) {
-                const double x = ix * step, y = iy * step;
-                const auto value = evaluate(x, y);
-                if (value.dfdy <= 0.0) vector_points.push_back({x, y, value.f});
-            }
-        });
-    });
-    long double vector_sum = 0.0L;
-    for (const auto& p : vector_points) vector_sum += p.f;
-    verify(vector_points.size(), vector_sum, sequential.size(), expected_sum);
+        std::cout << "Variant 26 -> formula 2: x_n = 4e9 * |sin(n)|\n"
+                  << "N = " << count << "\n"
+                  << "Generating the source sequence...\n";
 
-    concurrency::concurrent_queue<Point> queue_points;
-    const double tq = seconds([&] {
-        concurrency::parallel_for(0, kGrid, [&](int ix) {
-            for (int iy = 0; iy < kGrid; ++iy) {
-                const double x = ix * step, y = iy * step;
-                const auto value = evaluate(x, y);
-                if (value.dfdy <= 0.0) queue_points.push({x, y, value.f});
-            }
-        });
-    });
-    std::size_t queue_count = 0; long double queue_sum = 0.0L; Point point{};
-    while (queue_points.try_pop(point)) { ++queue_count; queue_sum += point.f; }
-    verify(queue_count, queue_sum, sequential.size(), expected_sum);
+        const std::vector<Value> source = make_sequence(count);
+        const Fingerprint expected = fingerprint(source);
 
-    std::cout << std::fixed << std::setprecision(6)
-              << "points=" << sequential.size() << '\n'
-              << "sequential vector=" << ts << " s\n"
-              << "concurrent_vector=" << tv << " s, speedup=" << ts / tv << '\n'
-              << "concurrent_queue=" << tq << " s, speedup=" << ts / tq << '\n';
+        std::vector<BenchmarkResult> results;
+        results.reserve(4);
+
+        results.push_back(benchmark(
+            "std::sort", source, expected,
+            [](std::vector<Value>& values) {
+                std::sort(values.begin(), values.end());
+            }));
+
+        results.push_back(benchmark(
+            "concurrency::parallel_sort", source, expected,
+            [](std::vector<Value>& values) {
+                concurrency::parallel_sort(values.begin(), values.end());
+            }));
+
+        results.push_back(benchmark(
+            "concurrency::parallel_buffered_sort", source, expected,
+            [](std::vector<Value>& values) {
+                concurrency::parallel_buffered_sort(values.begin(), values.end());
+            }));
+
+        results.push_back(benchmark(
+            "concurrency::parallel_radixsort", source, expected,
+            [](std::vector<Value>& values) {
+                concurrency::parallel_radixsort(values.begin(), values.end());
+            }));
+
+        std::cout << "\nSorting time only (copying and verification excluded):\n"
+                  << std::fixed << std::setprecision(6);
+        const double sequential_seconds = results.front().seconds;
+        for (const auto& result : results) {
+            print_result(result, sequential_seconds);
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "Error: " << error.what() << '\n';
+        return 1;
+    }
 }
